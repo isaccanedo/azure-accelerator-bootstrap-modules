@@ -1,0 +1,17 @@
+---
+extends: default
+
+ignore: |
+  **/bicep/**/ci-template.yaml
+  **/bicep/**/cd-template.yaml
+  *bicep-templates.yaml
+  **/bicep/**/cd.yaml
+
+rules:
+  # 500 chars should be enough, but don't fail if a line is longer
+  line-length:
+    max: 500
+    level: warning
+  truthy:
+    check-keys: false
+    level: warning

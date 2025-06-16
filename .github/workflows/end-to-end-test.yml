@@ -1,0 +1,542 @@
+---
+name: End to End Tests
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: ['opened', 'reopened', 'synchronize', 'labeled']
+  workflow_dispatch:
+    inputs:
+      powershell_branch:
+        description: 'The branch to use for the powershell module'
+        default: 'main'
+        type: string
+      alz_bicep_branch:
+        description: 'The branch to use for the bicep module'
+        default: 'main'
+        type: string
+      alz_terraform_branch:
+        description: 'The branch to use for the terraform module'
+        default: 'main'
+        type: string
+      alz_on_demand_folder_release_tag:
+        description: 'The tag to use for the on demand folder release'
+        default: 'latest'
+        type: string
+  schedule:
+    - cron: '0 9 * * 1'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  BOOTSTRAP_MODULE_FOLDER: ./bsm
+  STARTER_MODULE_FOLDER: ./stm
+  POWERSHELL_MODULE_FOLDER: ./psm
+  TARGET_FOLDER: ./out
+  LOCAL_TARGET_FOLDER: ./loc
+  BICEP_STARTER_MODULE_REPOSITORY: Azure/ALZ-Bicep
+  TERRAFORM_STARTER_MODULE_REPOSITORY: Azure/alz-terraform-accelerator
+  POWERSHELL_MODULE_REPOSITORY: Azure/ALZ-PowerShell-Module
+  ALZ_POWERSHELL_BRANCH: ${{ inputs.powershell_branch != '' && inputs.powershell_branch || 'main' }}
+  ALZ_BICEP_BRANCH: ${{ inputs.alz_bicep_branch != '' && inputs.alz_bicep_branch || 'main' }}
+  ALZ_TERRAFORM_BRANCH: ${{ inputs.alz_terraform_branch != '' && inputs.alz_terraform_branch || 'main' }}
+  ALZ_ON_DEMAND_FOLDER_RELEASE_TAG: ${{ inputs.alz_on_demand_folder_release_tag != '' && inputs.alz_on_demand_folder_release_tag || 'latest' }}
+
+jobs:
+  define-matrix:
+    name: Define Matrix
+    runs-on: ubuntu-latest
+
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+
+    steps:
+      - name: Checkout Bootstrap Modules
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: ${{ env.BOOTSTRAP_MODULE_FOLDER }}
+      - name: Generate Matrix
+        id: matrix
+        run: |
+          $matrix = ${{ env.BOOTSTRAP_MODULE_FOLDER }}/.github/tests/scripts/generate-matrix.ps1 -runNumber "${{ github.run_number }}"
+          $matrixJson = ConvertTo-Json $matrix -Depth 10 -Compress
+          Write-Host (ConvertTo-Json $matrix -Depth 10)
+          Write-Output "matrix=$matrixJson" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+
+  e2e-test:
+    needs: define-matrix
+    name: "${{ matrix.name }} (${{ matrix.ShortName }})"
+    environment: ${{ github.event_name == 'schedule' && 'CSUTFAUTO' || 'CSUTF' }}
+    if: "${{ github.repository == 'Azure/accelerator-bootstrap-modules' && (contains(github.event.pull_request.labels.*.name, 'PR: Safe to test 🧪') || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.define-matrix.outputs.matrix) }}
+
+    runs-on: ${{ matrix.operatingSystem }}-latest
+    steps:
+      - name: Show env
+        run: env | sort
+
+      - name: Checkout Bootstrap Modules
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: ${{ env.BOOTSTRAP_MODULE_FOLDER }}
+
+      - name: Checkout PowerShell Module
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.POWERSHELL_MODULE_REPOSITORY }}
+          ref: ${{ env.ALZ_POWERSHELL_BRANCH }}
+          path: ${{ env.POWERSHELL_MODULE_FOLDER }}
+
+      - name: Checkout Starter Modules for Bicep
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        if: ${{ matrix.infrastructureAsCode == 'bicep' }}
+        with:
+          repository: ${{ env.BICEP_STARTER_MODULE_REPOSITORY }}
+          ref: ${{ env.ALZ_BICEP_BRANCH }}
+          path: ${{ env.STARTER_MODULE_FOLDER }}
+
+      - name: Checkout Starter Modules for Terraform
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        if: ${{ matrix.infrastructureAsCode == 'terraform' }}
+        with:
+          repository: ${{ env.TERRAFORM_STARTER_MODULE_REPOSITORY }}
+          ref: ${{ env.ALZ_TERRAFORM_BRANCH }}
+          path: ${{ env.STARTER_MODULE_FOLDER }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: ${{ matrix.terraformVersion }}
+          terraform_wrapper: false
+        if: ${{ matrix.terraformVersion != 'latest' }}
+
+      - name: Setup ALZ Module Inputs
+        run: |
+
+          # Get Inputs
+          $infrastructureAsCode = "${{ matrix.infrastructureAsCode }}"
+          $versionControlSystem = "${{ matrix.versionControlSystem }}"
+          $operatingSystem = "${{ matrix.operatingSystem }}"
+          $terraformVersion = "${{ matrix.terraformVersion }}"
+          $selfHostedAgents = "${{ matrix.agentType }}"
+          $regions = "${{ matrix.regions }}"
+          $starterModule = "${{ matrix.starterModule }}"
+          $shortName = "${{ matrix.ShortName }}"
+          $deployAzureResources = "${{ matrix.deployAzureResources }}"
+
+          $locations = @(
+            "uksouth",
+            "northeurope",
+            "eastus",
+            "eastus2",
+            "canadacentral",
+            "westeurope",
+            "westus2",
+            "westus3",
+            "australiaeast",
+            "swedencentral"
+          )
+
+          $locationsSingleAvailabilityZone = @(
+            "ukwest"
+          )
+
+          $jobIndex = ${{ strategy.job-index }}
+          $locationIndex = $jobIndex % $locations.Length
+          $location2Index = $jobIndex % $locationsSingleAvailabilityZone.Length
+          $location = $locations[$locationIndex]
+          $location2 = $locationsSingleAvailabilityZone[$location2Index]
+
+          $enableSelfHostedAgents = "false"
+          if($selfHostedAgents -eq "public" -or $selfHostedAgents -eq "private") {
+            $enableSelfHostedAgents = "true"
+          }
+
+          $enablePrivateNetworking = "false"
+          if($selfHostedAgents -eq "private") {
+            $enablePrivateNetworking = "true"
+          }
+
+          $localDeployAzureResources = $deployAzureResources
+
+          $runNumber = "${{ github.run_number }}"
+
+          Write-Host "Infrastructure As Code: $infrastructureAsCode"
+          Write-Host "Version Control System: $versionControlSystem"
+          Write-Host "Operating System: $operatingSystem"
+          Write-Host "Terraform Version: $terraformVersion"
+          Write-Host "Self Hosted Agents: $selfHostedAgents"
+          Write-Host "Local Deploy Azure Resources: $localDeployAzureResources"
+          Write-Host "Run Number: $runNumber"
+          Write-Host "Starter Module: $starterModule"
+          Write-Host "Regions: $regions"
+          Write-Host "Location: $location"
+          Write-Host "Location 2: $location2"
+
+          $uniqueId = $shortName
+          echo "UNIQUE_ID=$uniqueId" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append
+
+          Write-Host "Unique ID: $uniqueId"
+
+          $versionControlSystemMapped = $versionControlSystem
+          if($versionControlSystem.Contains("-")) {
+            $versionControlSystemMapped = $versionControlSystem.Split("-")[1]
+          }
+
+          $Inputs = @{}
+          $Inputs["iac_type"] = $infrastructureAsCode
+          $Inputs["bootstrap_module_name"] = "alz_$versionControlSystemMapped"
+          $Inputs["starter_module_name"] =  $starterModule
+          $Inputs["bootstrap_location"] = $location
+          if($regions -eq "multi") {
+            $Inputs["starter_locations"] = @($location, $location2)
+          } else {
+            $Inputs["starter_locations"] = @($location)
+          }
+          $Inputs["bootstrap_subscription_id"] = ""
+          $Inputs["service_name"] = "alz"
+          $Inputs["environment_name"] = $uniqueId
+          $Inputs["postfix_number"] = "1"
+          $Inputs["create_branch_policies"] = "true"
+
+          $Inputs["use_private_networking"] = $enablePrivateNetworking
+          $Inputs["allow_storage_access_from_my_ip"] = "false"
+
+          if($versionControlSystem -eq "github") {
+            $Inputs["github_personal_access_token"] = "${{ secrets.VCS_TOKEN_GITHUB }}"
+            $Inputs["github_runners_personal_access_token"] = "${{ secrets.VCS_TOKEN_GITHUB }}"
+            $Inputs["github_organization_name"] = "${{ vars.VCS_ORGANIZATION }}"
+            $Inputs["use_separate_repository_for_templates"] = "true"
+            $Inputs["use_self_hosted_runners"] = $enableSelfHostedAgents
+            $Inputs["use_runner_group"] = "true"
+            if($location -eq "swedencentral") {
+              $Inputs["runner_container_zone_support"] = "false"
+            }
+          }
+
+          if($versionControlSystem -eq "azuredevops") {
+            $Inputs["azure_devops_personal_access_token"] = "${{ secrets.VCS_TOKEN_AZURE_DEVOPS }}"
+            $Inputs["azure_devops_agents_personal_access_token"] = "${{ secrets.VCS_TOKEN_AZURE_DEVOPS }}"
+            $Inputs["azure_devops_organization_name"] = "${{ vars.VCS_ORGANIZATION }}"
+            $Inputs["use_separate_repository_for_templates"] = "true"
+            $Inputs["azure_devops_use_organisation_legacy_url"] = "false"
+            $Inputs["azure_devops_create_project"] = "true"
+            $Inputs["azure_devops_project_name"] = "alz-test-$uniqueId"
+            $Inputs["use_self_hosted_agents"] = $enableSelfHostedAgents
+            if($location -eq "swedencentral") {
+              $Inputs["agent_container_zone_support"] = "false"
+            }
+          }
+
+          if($versionControlSystem -eq "local") {
+            $Inputs["target_directory"] = "${{ github.workspace }}/${{ env.LOCAL_TARGET_FOLDER }}"
+            $Inputs["create_bootstrap_resources_in_azure"] = $localDeployAzureResources
+          }
+
+          $Inputs["apply_approvers"] = @()
+          $Inputs["root_parent_management_group_id"] = ""
+          $Inputs["subscription_id_connectivity"] = "${{ vars.ARM_SUBSCRIPTION_ID }}"
+          $Inputs["subscription_id_identity"] = "${{ vars.ARM_SUBSCRIPTION_ID }}"
+          $Inputs["subscription_id_management"] = "${{ vars.ARM_SUBSCRIPTION_ID }}"
+
+          $Inputs["parent_management_group_display_name"] = "Tenant Root Group"
+          $Inputs["child_management_group_display_name"] = "E2E Test"
+          $Inputs["resource_group_location"] = $location
+
+          if($starterModule -eq "financial_services_landing_zone") {
+            $Inputs["management_group_configuration"] = @{
+              root = @{
+                id = "${default_prefix}${optional_postfix}"
+                display_name = "FSI Landing Zone"
+                archetypes = @("fsi_root", "tr_01_logging", "re_01_zonal_residency", "so_04_cmk", "so_01_data_residency")
+              }
+              platform = @{
+                id = "${default_prefix}-platform${optional_postfix}"
+                display_name = "Platform"
+                archetypes = @()
+              }
+              landingzones = @{
+                id = "${default_prefix}-landingzones${optional_postfix}"
+                display_name = "Landing Zones"
+                archetypes = @()
+              }
+              decommissioned = @{
+                id = "${default_prefix}-decommissioned${optional_postfix}"
+                display_name = "Decommissioned"
+                archetypes = @()
+              }
+              sandbox = @{
+                id = "${default_prefix}-sandbox${optional_postfix}"
+                display_name = "Sandbox"
+                archetypes = @()
+              }
+              management = @{
+                id = "${default_prefix}-platform-management${optional_postfix}"
+                display_name = "Management"
+                archetypes = @()
+              }
+              connectivity = @{
+                id = "${default_prefix}-platform-connectivity${optional_postfix}"
+                display_name = "Connectivity"
+                archetypes = @()
+              }
+              identity = @{
+                id = "${default_prefix}-platform-identity${optional_postfix}"
+                display_name = "Identity"
+                archetypes = @()
+              }
+              corp = @{
+                id = "${default_prefix}-landingzones-corp${optional_postfix}"
+                display_name = "Corp"
+                archetypes = @()
+              }
+              online = @{
+                id = "${default_prefix}-landingzones-online${optional_postfix}"
+                display_name = "Online"
+                archetypes = @()
+              }
+              confidential_corp = @{
+                id = "${default_prefix}-landingzones-confidential-corp${optional_postfix}"
+                display_name = "Confidential Corp"
+                archetypes = @("confidential")
+              }
+              confidential_online = @{
+                id = "${default_prefix}-landingzones-confidential-online${optional_postfix}"
+                display_name = "Confidential Online"
+                archetypes = @("confidential")
+              }
+            }
+          }
+
+          if($starterModule -eq "sovereign_landing_zone") {
+            $Inputs["management_group_configuration"] = @{
+              root = @{
+                id = "${default_prefix}${optional_postfix}"
+                display_name = "Sovereign Landing Zone"
+                archetypes = @("global")
+              }
+              platform = @{
+                id = "${default_prefix}-platform${optional_postfix}"
+                display_name = "Platform"
+                archetypes = @()
+              }
+              landingzones = @{
+                id = "${default_prefix}-landingzones${optional_postfix}"
+                display_name = "Landing Zones"
+                archetypes = @()
+              }
+              decommissioned = @{
+                id = "${default_prefix}-decommissioned${optional_postfix}"
+                display_name = "Decommissioned"
+                archetypes = @()
+              }
+              sandbox = @{
+                id = "${default_prefix}-sandbox${optional_postfix}"
+                display_name = "Sandbox"
+                archetypes = @()
+              }
+              management = @{
+                id = "${default_prefix}-platform-management${optional_postfix}"
+                display_name = "Management"
+                archetypes = @()
+              }
+              connectivity = @{
+                id = "${default_prefix}-platform-connectivity${optional_postfix}"
+                display_name = "Connectivity"
+                archetypes = @()
+              }
+              identity = @{
+                id = "${default_prefix}-platform-identity${optional_postfix}"
+                display_name = "Identity"
+                archetypes = @()
+              }
+              corp = @{
+                id = "${default_prefix}-landingzones-corp${optional_postfix}"
+                display_name = "Corp"
+                archetypes = @()
+              }
+              online = @{
+                id = "${default_prefix}-landingzones-online${optional_postfix}"
+                display_name = "Online"
+                archetypes = @()
+              }
+              confidential_corp = @{
+                id = "${default_prefix}-landingzones-confidential-corp${optional_postfix}"
+                display_name = "Confidential Corp"
+                archetypes = @("confidential")
+              }
+              confidential_online = @{
+                id = "${default_prefix}-landingzones-confidential-online${optional_postfix}"
+                display_name = "Confidential Online"
+                archetypes = @("confidential")
+              }
+            }
+          }
+
+          # Bicep
+          if($infrastructureAsCode -eq "bicep") {
+            $Inputs["Prefix"] = $uniqueId
+            $Inputs["Location"] = $location
+            $Inputs["Environment"] = "live"
+            $Inputs["SecurityContact"] = "test@test.com"
+            $Inputs["networkType"] = "none"
+          }
+
+          $json = ConvertTo-Json $Inputs -Depth 100
+          $json | Out-File -FilePath inputs.json -Encoding utf8 -Force
+
+        shell: pwsh
+
+      - name: Run ALZ PowerShell
+        run: |
+
+          # Get Inputs
+          $versionControlSystem = "${{ matrix.versionControlSystem }}"
+          $infrastructureAsCode = "${{ matrix.infrastructureAsCode }}"
+
+          # Install the Module
+          Write-Host "Installing the Accelerator PowerShell Module"
+          ${{ env.POWERSHELL_MODULE_FOLDER }}/actions_bootstrap_for_e2e_tests.ps1 | Out-String | Write-Verbose
+          Invoke-Build -File ${{ env.POWERSHELL_MODULE_FOLDER }}/src/ALZ.build.ps1 BuildAndInstallOnly | Out-String | Write-Verbose
+          Write-Host "Installed Accelerator Module"
+
+          # Run the Module in a retry loop
+          $retryCount = 0
+          $maximumRetries = 10
+          $retryDelay = 10000
+          $success = $false
+
+          do {
+            $retryCount++
+            try {
+              Write-Host "Running the ALZ Module"
+              $starterModuleOverrideFolderPath = "${{ env.STARTER_MODULE_FOLDER }}"
+              if($infrastructureAsCode -eq "terraform") {
+                $starterModuleOverrideFolderPath = "$starterModuleOverrideFolderPath/templates"
+              }
+              Deploy-Accelerator -output "${{ env.TARGET_FOLDER }}" -inputs "./inputs.json" -bootstrapModuleOverrideFolderPath "${{ env.BOOTSTRAP_MODULE_FOLDER }}" -starterModuleOverrideFolderPath $starterModuleOverrideFolderPath -starterRelease "${{ env.ALZ_ON_DEMAND_FOLDER_RELEASE_TAG }}" -autoApprove -skipAlzModuleVersionRequirementsCheck -ErrorAction Stop -Verbose
+
+              if ($LastExitCode -eq 0) {
+                $success = $true
+              } else {
+                throw "Failed to apply the bootstrap environment."
+              }
+            } catch {
+              Write-Host "Failed to apply the bootstrap environment. Destroy and retry..."
+              ${{ env.BOOTSTRAP_MODULE_FOLDER }}/.github/tests/scripts/destroy.ps1 -versionControlSystem $versionControlSystem
+            }
+          } while ($success -eq $false -and $retryCount -lt $maximumRetries)
+
+          if ($success -eq $false) {
+            Write-Host "File Structure after Bootstrap..."
+            $files = Get-ChildItem -File -Recurse -Force
+            $files | ForEach-Object { Write-Host  (Resolve-Path $_ -Relative)}
+            throw "Failed to apply the bootstrap environment after $maximumRetries attempts."
+          } else {
+            Write-Host "Output Folder Structure after Bootstrap..."
+            $files = Get-ChildItem -Path "${{ env.TARGET_FOLDER }}" -File -Recurse -Force
+            $files | ForEach-Object { Write-Host  (Resolve-Path $_ -Relative)}
+
+            if($versionControlSystem -eq "local") {
+              Write-Host ""
+              Write-Host "Local Output Folder Structure after Bootstrap..."
+              $files = Get-ChildItem -Path "${{ env.LOCAL_TARGET_FOLDER }}" -File -Recurse -Force
+              $files | ForEach-Object { Write-Host  (Resolve-Path $_ -Relative)}
+            }
+          }
+
+        shell: pwsh
+        env:
+          ARM_TENANT_ID: ${{ vars.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
+          ARM_CLIENT_ID: ${{ vars.ARM_CLIENT_ID }}
+          ARM_USE_OIDC: true
+
+      - name: Run Pipelines or Actions
+        run: |
+          $infrastructureAsCode = "${{ matrix.infrastructureAsCode }}"
+
+          # Get Inputs
+          $versionControlSystem = "${{ matrix.versionControlSystem }}"
+          $versionControlSystemOrganisationName = "${{ vars.VCS_ORGANIZATION }}"
+          $uniqueId = $ENV:UNIQUE_ID
+
+          if($versionControlSystem -eq "github") {
+            $repositoryName = "alz-$uniqueId"
+
+            Write-Host "Running GitHub Actions Test for CI"
+            ${{ env.BOOTSTRAP_MODULE_FOLDER }}/.github/tests/scripts/github-action-run.ps1 `
+              -organizationName $versionControlSystemOrganisationName `
+              -repositoryName $repositoryName `
+              -workflowFileName "ci.yaml" `
+              -skipDestroy `
+              -personalAccessToken "${{ secrets.VCS_TOKEN_GITHUB }}" `
+              -iac $infrastructureAsCode
+
+            Write-Host "Running GitHub Actions Test for CD"
+            ${{ env.BOOTSTRAP_MODULE_FOLDER }}/.github/tests/scripts/github-action-run.ps1 `
+              -organizationName $versionControlSystemOrganisationName `
+              -repositoryName $repositoryName `
+              -workflowFileName "cd.yaml" `
+              -personalAccessToken "${{ secrets.VCS_TOKEN_GITHUB }}"`
+              -iac $infrastructureAsCode
+          }
+
+          if($versionControlSystem -eq "azuredevops") {
+            $projectName = "alz-test-$uniqueId"
+
+            Write-Host "Running Azure DevOps Pipelines Test for CI"
+            ${{ env.BOOTSTRAP_MODULE_FOLDER }}/.github/tests/scripts/azuredevops-pipeline-run.ps1 `
+              -organizationName $versionControlSystemOrganisationName `
+              -projectName $projectName `
+              -pipelineNamePart "Continuous Integration" `
+              -skipDestroy `
+              -personalAccessToken "${{ secrets.VCS_TOKEN_AZURE_DEVOPS }}"`
+              -iac $infrastructureAsCode
+
+            Write-Host "Running Azure DevOps Pipelines Test for CD"
+            ${{ env.BOOTSTRAP_MODULE_FOLDER }}/.github/tests/scripts/azuredevops-pipeline-run.ps1 `
+              -organizationName $versionControlSystemOrganisationName `
+              -projectName $projectName `
+              -pipelineNamePart "Continuous Delivery" `
+              -personalAccessToken "${{ secrets.VCS_TOKEN_AZURE_DEVOPS }}"`
+              -iac $infrastructureAsCode
+          }
+
+        shell: pwsh
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: "latest"
+          terraform_wrapper: false
+        if: always()
+
+      - name: Run Terraform Destroy to Clean Up
+        if: always()
+        run: |
+
+          # Get Inputs
+          $versionControlSystem = "${{ matrix.versionControlSystem }}"
+
+          Write-Host "Installing the Accelerator PowerShell Module"
+          ${{ env.POWERSHELL_MODULE_FOLDER }}/actions_bootstrap_for_e2e_tests.ps1 | Out-String | Write-Verbose
+          Invoke-Build -File ${{ env.POWERSHELL_MODULE_FOLDER }}/src/ALZ.build.ps1 BuildAndInstallOnly | Out-String | Write-Verbose
+          Write-Host "Installed Accelerator Module"
+
+          # Run destroy
+          ${{ env.BOOTSTRAP_MODULE_FOLDER }}/.github/tests/scripts/destroy.ps1 -versionControlSystem $versionControlSystem
+
+        shell: pwsh
+        env:
+          ARM_TENANT_ID: ${{ vars.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
+          ARM_CLIENT_ID: ${{ vars.ARM_CLIENT_ID }}
+          ARM_USE_OIDC: true
